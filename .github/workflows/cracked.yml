@@ -57,7 +57,8 @@ jobs:
         id: test
         shell: bash
         run: |
-          set -uo pipefail
+          # GitHub runs this with bash -e; a failing suite must not end the step.
+          set +e -uo pipefail
           W="$GITHUB_WORKSPACE"; L="$W/learner"; CI="$W/craftinginterpreters"; OUT="$W/cracked-results.json"
           mkdir -p "$W/cracked-bin" "$W/cracked-logs"
           cfg() { if [ -f "$L/.cracked.json" ]; then jq -r --arg k "$1" '.[$k] // empty | tostring' "$L/.cracked.json" 2>/dev/null; fi; }
