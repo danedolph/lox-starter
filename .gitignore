@@ -1,0 +1,20 @@
+# Build output
+build/
+clox/build/
+*.class
+*.o
+*.dSYM/
+
+# The official repo and its test runner, fetched by scripts/test.sh
+.craftinginterpreters/
+
+# JVM crash logs
+hs_err_pid*
+replay_pid*
+
+# OS and editors
+.DS_Store
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json

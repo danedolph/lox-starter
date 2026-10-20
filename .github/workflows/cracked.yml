@@ -1,0 +1,187 @@
+# cracked.guide: runs the official Crafting Interpreters test suite against
+# your jlox and clox on every push, and tells cracked.guide which chapters
+# pass. Save as .github/workflows/cracked.yml in your Lox repository.
+#
+# No secrets: GitHub signs a short-lived token naming this repository
+# (id-token: write), and cracked.guide checks it against the repository you
+# connected at https://cracked.guide/verify.
+#
+# Optional .cracked.json at the repository root (paths from the root):
+#   { "build": "make", "jlox": "build/jlox", "clox": "build/clox" }
+# Without it, jlox is every .java file under jlox/ (the class whose file is
+# Lox.java is the entry point) and clox is every .c file next to clox's main.c.
+# "jlox_through": 10 or "clox_through": 24 stop at the chapter you are on.
+name: cracked.guide
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cracked-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: learner
+
+      - uses: actions/checkout@v4
+        with:
+          repository: munificent/craftinginterpreters
+          path: craftinginterpreters
+
+      # The test runner predates Dart 3 (tool/pubspec.yaml wants <3.0.0).
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 2.19.6
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Get the test runner's packages
+        working-directory: craftinginterpreters/tool
+        run: dart pub get
+
+      - name: Build and test
+        id: test
+        shell: bash
+        run: |
+          set -uo pipefail
+          W="$GITHUB_WORKSPACE"; L="$W/learner"; CI="$W/craftinginterpreters"; OUT="$W/cracked-results.json"
+          mkdir -p "$W/cracked-bin" "$W/cracked-logs"
+          cfg() { if [ -f "$L/.cracked.json" ]; then jq -r --arg k "$1" '.[$k] // empty | tostring' "$L/.cracked.json" 2>/dev/null; fi; }
+          abs() { case "$1" in /*) echo "$1" ;; *) echo "$L/$1" ;; esac; }
+          BUILD="$(cfg build)"; JLOX="$(cfg jlox)"; CLOX="$(cfg clox)"
+          JTHROUGH="$(cfg jlox_through)"; CTHROUGH="$(cfg clox_through)"
+          build_ok=true; build_log=""
+
+          if [ -n "$BUILD" ]; then
+            echo "::group::build: $BUILD"
+            (cd "$L" && bash -c "$BUILD") 2>&1 | tee "$W/cracked-logs/build.log" || build_ok=false
+            echo "::endgroup::"
+          fi
+
+          # Defaults for a repository laid out like the book's.
+          if [ -z "$JLOX" ] && [ -d "$L/jlox" ]; then
+            main="$(find "$L/jlox" -name Lox.java -not -path '*/test/*' | head -n 1)"
+            if [ -n "$main" ]; then
+              pkg="$(sed -n 's/^[[:space:]]*package[[:space:]]\{1,\}\([A-Za-z0-9_.]\{1,\}\)[[:space:]]*;.*/\1/p' "$main" | head -n 1)"
+              cls="${pkg:+$pkg.}Lox"
+              # Expr.java and Stmt.java come from GenerateAst; make them if they are not committed.
+              gen="$(find "$L/jlox" -name GenerateAst.java | head -n 1)"
+              if [ -n "$gen" ] && [ ! -f "$(dirname "$main")/Expr.java" ]; then
+                gpkg="$(sed -n 's/^[[:space:]]*package[[:space:]]\{1,\}\([A-Za-z0-9_.]\{1,\}\)[[:space:]]*;.*/\1/p' "$gen" | head -n 1)"
+                javac -nowarn -d "$W/cracked-bin/generate-ast" "$gen" && java -cp "$W/cracked-bin/generate-ast" "${gpkg:+$gpkg.}GenerateAst" "$(dirname "$main")"
+              fi
+              echo "::group::javac jlox ($cls)"
+              if find "$L/jlox" -name '*.java' -not -path '*/test/*' -print0 | xargs -0 javac -nowarn -d "$W/cracked-bin/jlox-classes" 2>&1 | tee -a "$W/cracked-logs/build.log"; then
+                printf '#!/bin/sh\nexec java -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8 -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -cp "%s" %s "$@"\n' "$W/cracked-bin/jlox-classes" "$cls" > "$W/cracked-bin/jlox"
+                chmod +x "$W/cracked-bin/jlox"; JLOX="$W/cracked-bin/jlox"
+              else build_ok=false; fi
+              echo "::endgroup::"
+            fi
+          fi
+          if [ -z "$CLOX" ] && [ -d "$L/clox" ]; then
+            main="$(find "$L/clox" -name main.c | head -n 1)"
+            if [ -n "$main" ]; then
+              echo "::group::cc clox"
+              if cc -O2 -o "$W/cracked-bin/clox" "$(dirname "$main")"/*.c -lm 2>&1 | tee -a "$W/cracked-logs/build.log"; then
+                CLOX="$W/cracked-bin/clox"
+              else build_ok=false; fi
+              echo "::endgroup::"
+            fi
+          fi
+          [ -n "$JLOX" ] && JLOX="$(abs "$JLOX")"
+          [ -n "$CLOX" ] && CLOX="$(abs "$CLOX")"
+
+          # The JVM announces these on stderr, which the tests read as errors.
+          # The tests print non-ASCII strings: run under a UTF-8 locale.
+          unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS
+          export LC_ALL=C.UTF-8 LANG=C.UTF-8
+          JAVA_SUITES="chap04_scanning chap06_parsing chap07_evaluating chap08_statements chap09_control chap10_functions chap11_resolving chap12_classes chap13_inheritance"
+          C_SUITES="chap17_compiling chap18_types chap19_strings chap20_hash chap21_global chap22_local chap23_jumping chap24_calls chap25_closures chap26_garbage chap27_classes chap28_methods chap29_superclasses chap30_optimization"
+          results="[]"
+
+          # Furthest chapter first. A later chapter's suite covers the earlier
+          # ones (whose expected output the finished interpreter no longer
+          # prints), so the first suite that passes ends the run.
+          run_suites() {
+            local name="$1" interp="$2" through="$3"; shift 3
+            local suites=() s n
+            for s in "$@"; do n="${s:4:2}"; n="${n#0}"
+              if [ -z "$through" ] || [ "$n" -le "$through" ]; then suites=("$s" "${suites[@]}"); fi
+            done
+            # test.dart waits forever on a test that never ends; give each one 10 seconds.
+            local run="$W/cracked-bin/run-$name"
+            printf '#!/bin/sh\nexec timeout 10 "%s" "$@"\n' "$interp" > "$run"; chmod +x "$run"
+            for s in "${suites[@]}"; do
+              if [ ! -x "$interp" ]; then
+                results="$(jq -c --arg s "$s" --arg i "$name" '. + [{suite: $s, interpreter: $i, ok: false, passed: 0, failed: 0, error: "not executable"}]' <<<"$results")"
+                return
+              fi
+              echo "::group::$s ($name)"
+              log="$W/cracked-logs/$s.log"
+              (cd "$CI" && timeout 900 dart tool/bin/test.dart "$s" --interpreter "$run") > "$log" 2>&1
+              code=$?
+              grep -E '^(FAIL|All [0-9]+ tests passed|[0-9]+ tests passed)' "$log" | tail -n 40
+              summary="$(grep -E '^(All [0-9]+ tests passed|[0-9]+ tests passed)' "$log" | tail -n 1)"
+              passed="$(sed -n 's/^All \([0-9]*\) tests passed.*/\1/p; s/^\([0-9]*\) tests passed\..*/\1/p' <<<"$summary")"
+              failed="$(sed -n 's/.* \([0-9]*\) tests failed\..*/\1/p' <<<"$summary")"
+              fails="$(grep -E '^FAIL ' "$log" | head -n 10 | sed 's/^FAIL //' | jq -R . | jq -sc .)"
+              ok=false; [ "$code" = 0 ] && ok=true
+              [ "$code" = 124 ] && echo "$s timed out after 15 minutes"
+              results="$(jq -c --arg s "$s" --arg i "$name" --argjson ok "$ok" --argjson p "${passed:-0}" --argjson f "${failed:-0}" --argjson fails "$fails" --argjson code "$code" \
+                '. + [{suite: $s, interpreter: $i, ok: $ok, passed: $p, failed: $f, exit: $code, failures: $fails}]' <<<"$results")"
+              echo "::endgroup::"
+              if [ "$ok" = true ]; then return; fi
+            done
+          }
+          [ -n "$JLOX" ] && run_suites jlox "$JLOX" "$JTHROUGH" $JAVA_SUITES
+          [ -n "$CLOX" ] && run_suites clox "$CLOX" "$CTHROUGH" $C_SUITES
+
+          jq -n --argjson suites "$results" --argjson build_ok "$build_ok" \
+            --arg repository "${GITHUB_REPOSITORY:-}" --arg sha "${GITHUB_SHA:-}" --arg run_id "${GITHUB_RUN_ID:-}" --arg run_attempt "${GITHUB_RUN_ATTEMPT:-1}" \
+            --arg jlox "$JLOX" --arg clox "$CLOX" \
+            '{version: 1, repository: $repository, sha: $sha, run_id: $run_id, run_attempt: $run_attempt, build_ok: $build_ok, jlox: ($jlox != ""), clox: ($clox != ""), suites: $suites}' > "$OUT"
+          cat "$OUT"
+          if [ -z "$JLOX$CLOX" ]; then echo "::warning::No jlox or clox found. Add .cracked.json (see the comment at the top of this file)."; fi
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cracked-results
+          path: |
+            cracked-results.json
+            cracked-logs/
+          if-no-files-found: ignore
+
+      - name: Report to cracked.guide
+        if: always() && steps.test.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('cracked-results.json', 'utf8'));
+            const token = await core.getIDToken('cracked.guide');
+            const res = await fetch('https://cracked.guide/api/verify/github', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+              body: JSON.stringify(results),
+            });
+            const text = await res.text();
+            if (res.ok) core.notice(`cracked.guide: ${text}`);
+            else core.warning(`cracked.guide answered ${res.status}: ${text}`);
+            const failed = results.suites.filter((s) => !s.ok).map((s) => s.suite);
+            if (!results.suites.some((s) => s.ok) && results.suites.length) core.setFailed(`No suite passed: ${failed.join(', ')}`);

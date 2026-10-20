@@ -1,0 +1,28 @@
+{
+  "name": "lox (Java 21, C, Dart 2.19)",
+  "build": { "dockerfile": "Dockerfile" },
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "21",
+      "jdkDistro": "tem",
+      "installMaven": "false",
+      "installGradle": "false"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vscjava.vscode-java-pack",
+        "ms-vscode.cpptools",
+        "ms-vscode.makefile-tools",
+        "EditorConfig.EditorConfig"
+      ]
+    },
+    "codespaces": {
+      "openFiles": ["README.md"]
+    }
+  },
+  "hostRequirements": { "cpus": 2 },
+  "postCreateCommand": "java -version && cc --version | head -n 1 && dart --version",
+  "remoteUser": "vscode"
+}
